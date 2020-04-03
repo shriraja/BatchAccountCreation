@@ -2,12 +2,17 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Control Tower Batch Account Creation
 Parameters:
   URLForInputCSVFile:
-    Default: ''
+    Default: 'https://vinjak-ctohio-outbox.s3.us-east-2.amazonaws.com/sample.csv'
     Description: URL for Batch Account Creation CSV file.
     NoEcho: 'false'
     Type: String
+  S3BucketName:
+    Default: 'vinjak-ctohio-outbox'
+    Description: S3 Bucket - Location of lambda .zip files
+    Type: 'String'
+
 Resources:
-  NewAccountDetail5F2BE132:
+  NewAccountDetailsTable:
     Type: AWS::DynamoDB::Table
     Properties:
       KeySchema:
@@ -19,10 +24,9 @@ Resources:
       ProvisionedThroughput:
         ReadCapacityUnits: 5
         WriteCapacityUnits: 5
-      TableName: NewAccountDetail
     UpdateReplacePolicy: Delete
     DeletionPolicy: Delete
-  NewAccountHandlerServiceRoleFD202B92:
+  NewAccountHandlerLambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -38,7 +42,7 @@ Resources:
             - - "arn:"
               - Ref: AWS::Partition
               - :iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  NewAccountHandlerServiceRoleDefaultPolicyD271CA51:
+  NewAccountHandlerPolicy:
     Type: AWS::IAM::Policy
     Properties:
       PolicyDocument:
@@ -52,62 +56,85 @@ Resources:
             Effect: Allow
             Resource:
               - Fn::GetAtt:
-                  - NewAccountDetail5F2BE132
+                  - NewAccountDetailsTable
                   - Arn
               - Ref: AWS::NoValue
         Version: "2012-10-17"
-      PolicyName: NewAccountHandlerServiceRoleDefaultPolicyD271CA51
+      PolicyName: NewAccountHandlerPolicy
       Roles:
-        - Ref: NewAccountHandlerServiceRoleFD202B92
-  NewAccountHandler058C7B8E:
+        - Ref: NewAccountHandlerLambdaExecutionRole
+  NewAccountHandlerLambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
       Code:
-        S3Bucket: trashyard
+        S3Bucket: !Ref S3BucketName
         S3Key: ct_batchcreation_lambda.zip
       Handler: NewAccountHandler.account_handler
       Role:
         Fn::GetAtt:
-          - NewAccountHandlerServiceRoleFD202B92
+          - NewAccountHandlerLambdaExecutionRole
           - Arn
       Runtime: python3.7
       Environment:
         Variables:
           TABLE_NAME:
-            Ref: NewAccountDetail5F2BE132
+            Ref: NewAccountDetailsTable
           BATCH_ACCT_INPUT:
             Ref: URLForInputCSVFile
       Timeout: 300
     DependsOn:
-      - NewAccountHandlerServiceRoleDefaultPolicyD271CA51
-      - NewAccountHandlerServiceRoleFD202B92
-
-  CaptureControlTowerLifeCycleEvents:
+      - NewAccountHandlerPolicy
+      - NewAccountHandlerLambdaExecutionRole
+  NewAccountHandlerTriggerLambda:
+    Type: 'Custom::AccountHandler'
     DependsOn:
-    - TriggerCustomizationsOnLifeCycleEvent
-    Type: AWS::Events::Rule
+      - NewAccountHandlerLambdaFunction
     Properties:
-      Description: Capture Control Tower LifeCycle Events and Trigger an Action
-      EventPattern:
-        detail:
-          eventName:
-          - CreateManagedAccount
-          eventSource:
-          - controltower.amazonaws.com
-        detail-type:
-        - AWS Service Event via CloudTrail
-        source:
-        - aws.controltower
-      Name: CaptureControlTowerLifeCycleEvents
-      State: ENABLED
-      Targets:
-      - Arn: !GetAtt "TriggerCustomizationsOnLifeCycleEvent.Arn"
-        Id: IDCaptureControlTowerLifeCycleEvents
+      ServiceToken: !GetAtt
+        - NewAccountHandlerLambdaFunction
+        - Arn
 
-  LambdaRoleToCaptureEvents:
+  TargetLamdbaForCreateManagedAccount:
+    DependsOn:
+    - CreateManagedAccountLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: ct_account_create_lambda.zip
+      Handler: account_create.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt "CreateManagedAccountLambdaRole.Arn"
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: NewAccountDetailsTable
+          PRINCIPAL_ARN:
+            !GetAtt "CreateManagedAccountLambdaRole.Arn"
+
+  TargetLambdaTrigger:
+    Type: 'Custom::AccountHandler'
+    DependsOn:
+      - TargetLamdbaForCreateManagedAccount
+      - NewAccountHandlerTriggerLambda
+    Properties:
+      ServiceToken: !GetAtt
+        - TargetLamdbaForCreateManagedAccount
+        - Arn
+
+  PermissionForEventsToInvokeLambdachk:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt "TargetLamdbaForCreateManagedAccount.Arn"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt "CaptureControlTowerLifeCycleEvents.Arn"
+
+  CreateManagedAccountLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: LambdaRoleToCaptureEvents
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -128,62 +155,26 @@ Resources:
                 Resource: !Join [':',['arn:aws:cloudformation', !Ref 'AWS::Region', !Ref 'AWS::AccountId', 'stackset/*:*']]
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AdministratorAccess 
 
-  TriggerCustomizationsOnLifeCycleEvent:
+  CaptureControlTowerLifeCycleEvents:
     DependsOn:
-    - LambdaRoleToCaptureEvents
-    Type: AWS::Lambda::Function
+    - TargetLamdbaForCreateManagedAccount
+    Type: AWS::Events::Rule
     Properties:
-      Code:
-        ZipFile: |
-          import json
-          import boto3
-          import logging
-          LOGGER = logging.getLogger()
-          LOGGER.setLevel(logging.INFO)
-          stackset_list = ['VPC-FLOWLOG-CREATION', 'DOME9-ROLES-CREATION']
-          result = {"ResponseMetadata":{"HTTPStatusCode":"400"}}
-          def lambda_handler(event, context):
-              masterAcct = event['account']
-              eventDetails = event['detail']
-              regionName = eventDetails['awsRegion']
-              eventName = eventDetails['eventName']
-              srvEventDetails = eventDetails['serviceEventDetails']
-              if eventName == 'CreateManagedAccount':
-                  newAccInfo = srvEventDetails['createManagedAccountStatus']
-                  cmdStatus = newAccInfo['state']
-                  if cmdStatus == 'SUCCEEDED':
-                      '''Sucessful event recieved'''
-                      ouInfo = newAccInfo['organizationalUnit']
-                      ouName = ouInfo['organizationalUnitName']
-                      odId = ouInfo['organizationalUnitId']
-                      accId = newAccInfo['account']['accountId']
-                      accName = newAccInfo['account']['accountName']
-                  else:
-                      '''Unsucessful event recieved'''
-                      LOGGER.info('Unsucessful Event Recieved. SKIPPING :{}'.format(event))
-                      return(False)
-              else:
-                  LOGGER.info('Control Tower Event Captured :{}'.format(event))
-      Handler: index.lambda_handler
-      MemorySize: 128
-      Role: !GetAtt "LambdaRoleToCaptureEvents.Arn"
-      Runtime: python3.7
-      Timeout: 60
+      Description: Capture Control Tower LifeCycle Events and Trigger an Action
+      EventPattern:
+        detail:
+          eventName:
+          - CreateManagedAccount
+          eventSource:
+          - controltower.amazonaws.com
+        detail-type:
+        - AWS Service Event via CloudTrail
+        source:
+        - aws.controltower
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt "TargetLamdbaForCreateManagedAccount.Arn"
+        Id: IDCaptureControlTowerLifeCycleEvents
 
-  PermissionForEventsToInvokeLambdachk:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !GetAtt "TriggerCustomizationsOnLifeCycleEvent.Arn"
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt "CaptureControlTowerLifeCycleEvents.Arn"
-
-  TriggerLambda:
-    Type: 'Custom::AccountHandler'
-    DependsOn:
-      - NewAccountHandler058C7B8E
-    Properties:
-      ServiceToken: !GetAtt
-        - NewAccountHandler058C7B8E
-        - Arn
