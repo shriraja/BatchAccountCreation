@@ -24,6 +24,8 @@ Resources:
       ProvisionedThroughput:
         ReadCapacityUnits: 5
         WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
     UpdateReplacePolicy: Delete
     DeletionPolicy: Delete
   NewAccountHandlerLambdaExecutionRole:
@@ -89,6 +91,7 @@ Resources:
     Type: 'Custom::AccountHandler'
     DependsOn:
       - NewAccountHandlerLambdaFunction
+      - EventSourceMapping
     Properties:
       ServiceToken: !GetAtt
         - NewAccountHandlerLambdaFunction
@@ -106,7 +109,7 @@ Resources:
       MemorySize: 128
       Role: !GetAtt "CreateManagedAccountLambdaRole.Arn"
       Runtime: python3.7
-      Timeout: 60
+      Timeout: 300
       Environment:
         Variables:
           TABLE_NAME:
@@ -119,6 +122,7 @@ Resources:
     DependsOn:
       - TargetLamdbaForCreateManagedAccount
       - NewAccountHandlerTriggerLambda
+      - EventSourceMapping
     Properties:
       ServiceToken: !GetAtt
         - TargetLamdbaForCreateManagedAccount
@@ -178,3 +182,14 @@ Resources:
       - Arn: !GetAtt "TargetLamdbaForCreateManagedAccount.Arn"
         Id: IDCaptureControlTowerLifeCycleEvents
 
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: TargetLamdbaForCreateManagedAccount
+    Properties:
+      EventSourceArn: !GetAtt 
+        - NewAccountDetailsTable
+        - StreamArn
+      FunctionName: !GetAtt
+        - TargetLamdbaForCreateManagedAccount
+        - Arn
+      StartingPosition: LATEST
